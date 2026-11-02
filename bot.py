@@ -160,6 +160,9 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS channels(
     id INTEGER PRIMARY KEY, title TEXT, link TEXT, added_at INTEGER);
 CREATE TABLE IF NOT EXISTS states(user_id INTEGER PRIMARY KEY, action TEXT, data TEXT);
+CREATE TABLE IF NOT EXISTS promos(
+    code TEXT PRIMARY KEY, percent INTEGER, active INTEGER DEFAULT 1,
+    used INTEGER DEFAULT 0, created_at INTEGER);
 """
 
 
@@ -268,8 +271,13 @@ async def render(key, oid=None):
     s = await gs(key)
     card = await gs("card")
     holder = await gs("holder")
+    price = await gs("price") or 0
+    if oid:
+        orow = await one("SELECT price FROM orders WHERE id=?", oid)
+        if orow and orow["price"]:
+            price = orow["price"]
     rep = {
-        "{price}": fmt(await gs("price") or 0),
+        "{price}": fmt(price),
         "{card}": html.escape(card) if card else "kiritilmagan",
         "{holder}": html.escape(holder) if holder else "—",
         "{id}": str(oid or ""),
@@ -384,7 +392,9 @@ def card_caption(o, u):
     s = (
         f"🆕 <b>Buyurtma #{o['id']}</b>\n\n"
         f"👤 {name}\n🔗 {uname}\n🆔 <code>{u['id']}</code>\n"
-        f"💰 {fmt(o['price'])} so'm\n🎬 Videolar: {o['video_count']} ta\n"
+        f"💰 {fmt(o['price'])} so'm\n"
+        + (f"🎟 Promokod: {html.escape(o['promo_code'])} (-{o['promo_percent']}%)\n" if o["promo_code"] else "")
+        + f"🎬 Videolar: {o['video_count']} ta\n"
         f"🕒 {fdt(o['submitted_at'])}\n\n"
         f"Holat: <b>{STATUS.get(o['status'], o['status'])}</b>"
     )
@@ -452,6 +462,8 @@ async def submit_order(o):
             )
         return False
     await run("UPDATE orders SET card_msg_id=? WHERE id=?", msg.message_id, o["id"])
+    if o["promo_code"]:
+        await run("UPDATE promos SET used=used+1 WHERE code=?", o["promo_code"])
     vids = await fetch("SELECT * FROM order_videos WHERE order_id=? ORDER BY id", o["id"])
     for i, v in enumerate(vids, 1):
         try:
@@ -518,7 +530,7 @@ async def show_welcome(uid):
 
 async def draft(uid):
     return await one(
-        "SELECT * FROM orders WHERE user_id=? AND status IN ('receipt','videos') ORDER BY id DESC LIMIT 1",
+        "SELECT * FROM orders WHERE user_id=? AND status IN ('promo','promo_in','receipt','videos') ORDER BY id DESC LIMIT 1",
         uid,
     )
 
@@ -545,7 +557,7 @@ async def cmd_cancel(m: Message):
         await clear_state(uid)
         await m.answer("❎ Bekor qilindi.")
         return await send_menu(uid)
-    await run("UPDATE orders SET status='cancelled' WHERE user_id=? AND status IN ('receipt','videos')", uid)
+    await run("UPDATE orders SET status='cancelled' WHERE user_id=? AND status IN ('promo','promo_in','receipt','videos')", uid)
     await m.answer("❎ Bekor qilindi. Qayta boshlash: /start")
 
 
@@ -574,25 +586,113 @@ async def on_next(c: CallbackQuery):
         return await safe_send(uid, await render("closed_text"))
     if not await gs("card"):
         return await safe_send(uid, "⚠️ To'lov ma'lumotlari hali kiritilmagan. Keyinroq urinib ko'ring.")
-    await run("UPDATE orders SET status='cancelled' WHERE user_id=? AND status IN ('receipt','videos')", uid)
+    await run("UPDATE orders SET status='cancelled' WHERE user_id=? AND status IN ('promo','promo_in','receipt','videos')", uid)
     oid, _ = await run(
         "INSERT INTO orders(user_id,status,price,created_at) VALUES(?,?,?,?)",
         uid,
-        "receipt",
+        "promo",
         int(await gs("price") or 0),
         int(time.time()),
     )
+    has_promo = (await one("SELECT COUNT(*) FROM promos WHERE active=1"))[0]
+    if not has_promo:
+        return await pay_step(uid, oid)
+    await safe_send(uid, PROMO_ASK, markup=promo_kb())
+
+
+PROMO_ASK = (
+    "🎟 <b>Promokodingiz bormi?</b>\n\n"
+    "Promokod bo'lsa chegirma olasiz. Bo'lmasa, «Promokodsiz davom etish» tugmasini bosing."
+)
+
+
+def promo_kb():
+    return kb(
+        [("🎟 Promokod kiritish", "pc:enter")],
+        [("➡️ Promokodsiz davom etish", "pc:skip")],
+        [("❌ Bekor qilish", "ucancel")],
+    )
+
+
+async def cur_promo_order(uid):
+    return await one(
+        "SELECT * FROM orders WHERE user_id=? AND status IN ('promo','promo_in') ORDER BY id DESC LIMIT 1",
+        uid,
+    )
+
+
+async def pay_step(uid, oid):
+    """To'lov bosqichiga o'tish (promokod bosqichidan keyin yoki promokod yo'q bo'lsa)."""
+    _, n = await run(
+        "UPDATE orders SET status='receipt' WHERE id=? AND status IN ('promo','promo_in')", oid
+    )
+    if not n:
+        return
+    o = await one("SELECT * FROM orders WHERE id=?", oid)
+    text = await render("pay_text", oid)
+    if o["promo_code"]:
+        text = (
+            f"🎟 Promokod <b>{html.escape(o['promo_code'])}</b> qo'llanildi: <b>-{o['promo_percent']}%</b>\n"
+            f"Narx: <s>{fmt(await gs('price'))}</s> → <b>{fmt(o['price'])} so'm</b>\n\n" + text
+        )
     await safe_send(
         uid,
-        await render("pay_text", oid),
+        text,
         await gs("pay_photo") or None,
         kb([("❌ Bekor qilish", "ucancel")]),
     )
 
 
+@r.callback_query(F.data == "pc:enter")
+async def pc_enter(c: CallbackQuery):
+    o = await cur_promo_order(c.from_user.id)
+    if not o:
+        return await c.answer("Buyurtma topilmadi. /start ni bosing", show_alert=True)
+    await run("UPDATE orders SET status='promo_in' WHERE id=?", o["id"])
+    await c.answer()
+    await show(
+        c,
+        "🎟 <b>Promokodni yozib yuboring</b>\n\nMasalan: <code>ABE20</code>",
+        kb([("➡️ Promokodsiz davom etish", "pc:skip")], [("❌ Bekor qilish", "ucancel")]),
+    )
+
+
+@r.callback_query(F.data == "pc:skip")
+async def pc_skip(c: CallbackQuery):
+    o = await cur_promo_order(c.from_user.id)
+    if not o:
+        return await c.answer("Buyurtma topilmadi. /start ni bosing", show_alert=True)
+    await c.answer()
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await pay_step(c.from_user.id, o["id"])
+
+
+async def apply_promo(m: Message, o):
+    code = (m.text or "").strip().upper()
+    p = await one("SELECT * FROM promos WHERE code=? AND active=1", code) if code else None
+    if not p:
+        return await m.answer(
+            "❌ Bunday promokod topilmadi yoki faol emas.\nQayta yozing yoki davom eting 👇",
+            reply_markup=kb([("➡️ Promokodsiz davom etish", "pc:skip")], [("❌ Bekor qilish", "ucancel")]),
+        )
+    base = int(await gs("price") or 0)
+    new_price = max(base * (100 - p["percent"]) // 100, 1)
+    await run(
+        "UPDATE orders SET promo_code=?, promo_percent=?, price=? WHERE id=?",
+        p["code"],
+        p["percent"],
+        new_price,
+        o["id"],
+    )
+    await pay_step(m.from_user.id, o["id"])
+
+
 @r.callback_query(F.data == "ucancel")
 async def on_ucancel(c: CallbackQuery):
-    await run("UPDATE orders SET status='cancelled' WHERE user_id=? AND status IN ('receipt','videos')", c.from_user.id)
+    await run("UPDATE orders SET status='cancelled' WHERE user_id=? AND status IN ('promo','promo_in','receipt','videos')", c.from_user.id)
     await c.answer("Bekor qilindi")
     try:
         await c.message.edit_reply_markup(reply_markup=None)
@@ -675,6 +775,11 @@ async def on_media(m: Message):
             uid,
             await render("videos_text", o["id"]),
             markup=kb([("❌ Bekor qilish", "ucancel")]),
+        )
+
+    if o["status"] in ("promo", "promo_in"):
+        return await m.answer(
+            "🎟 Avval promokod bosqichini yakunlang:", reply_markup=promo_kb()
         )
 
     # status == videos
@@ -786,6 +891,7 @@ async def menu_view():
         [("📣 Xabar yuborish", "a:bc"), ("📢 Majburiy obuna", "a:chs")],
         [("💰 Narx", "a:price"), ("💳 Karta", "a:card")],
         [("✏️ Matnlar", "a:texts"), ("🖼 Rasmlar", "a:photos")],
+        [("🎟 Promokodlar", "a:promos")],
         [(toggle, "a:toggle")],
     )
     return text, markup
@@ -1071,6 +1177,92 @@ async def a_chdel(c: CallbackQuery):
     await a_chs(c)
 
 
+# --- promokodlar ---
+@r.callback_query(F.data == "a:promos", F.from_user.id.in_(ADMIN_IDS))
+async def a_promos(c: CallbackQuery):
+    await c.answer()
+    await clear_state(c.from_user.id)
+    ps = await fetch("SELECT * FROM promos ORDER BY created_at DESC")
+    btns = [
+        [(f"{'🟢' if p['active'] else '🔴'} {p['code']} — {p['percent']}% · {p['used']} ta", f"a:prv:{p['code']}")]
+        for p in ps
+    ]
+    btns.append([("➕ Promokod qo'shish", "a:pradd")])
+    btns.append(BACK)
+    text = "🎟 <b>Promokodlar</b>\n\n" + (
+        "Promokodni bosib o'zgartirish, o'chirish yoki to'xtatish mumkin.\n"
+        "Raqam — necha marta ishlatilgani."
+        if ps
+        else "Hozircha promokod yo'q. Promokod bo'lmasa, mijozlarga promokod so'ralmaydi."
+    )
+    await show(c, text, kb(*btns))
+
+
+@r.callback_query(F.data == "a:pradd", F.from_user.id.in_(ADMIN_IDS))
+async def a_pradd(c: CallbackQuery):
+    await set_state(c.from_user.id, "pcode")
+    await c.answer()
+    await show(
+        c,
+        "➕ <b>Yangi promokod</b>\n\n1/2 — Promokodni yozing (harf va raqam, 3-20 belgi).\nMasalan: <code>ABE20</code>",
+        kb([("🚫 Bekor", "a:promos")]),
+    )
+
+
+async def promo_view(c: CallbackQuery, code):
+    p = await one("SELECT * FROM promos WHERE code=?", code)
+    if not p:
+        return await show(c, "Promokod topilmadi.", kb([("🔙 Promokodlar", "a:promos")]))
+    text = (
+        f"🎟 <b>{html.escape(p['code'])}</b>\n\n"
+        f"Chegirma: <b>{p['percent']}%</b>\n"
+        f"Ishlatilgan: <b>{p['used']}</b> ta\n"
+        f"Holat: {'🟢 faol' if p['active'] else '🔴 to`xtatilgan'}"
+    )
+    await show(
+        c,
+        text,
+        kb(
+            [("🔴 To'xtatish" if p["active"] else "🟢 Yoqish", f"a:prt:{code}")],
+            [("✏️ Foizni o'zgartirish", f"a:pre:{code}")],
+            [("🗑 O'chirish", f"a:prd:{code}")],
+            [("🔙 Promokodlar", "a:promos")],
+        ),
+    )
+
+
+@r.callback_query(F.data.regexp(r"^a:prv:[A-Z0-9_-]+$"), F.from_user.id.in_(ADMIN_IDS))
+async def a_prv(c: CallbackQuery):
+    await c.answer()
+    await promo_view(c, c.data.split(":")[2])
+
+
+@r.callback_query(F.data.regexp(r"^a:prt:[A-Z0-9_-]+$"), F.from_user.id.in_(ADMIN_IDS))
+async def a_prt(c: CallbackQuery):
+    code = c.data.split(":")[2]
+    await run("UPDATE promos SET active=1-active WHERE code=?", code)
+    await c.answer("Saqlandi")
+    await promo_view(c, code)
+
+
+@r.callback_query(F.data.regexp(r"^a:pre:[A-Z0-9_-]+$"), F.from_user.id.in_(ADMIN_IDS))
+async def a_pre(c: CallbackQuery):
+    code = c.data.split(":")[2]
+    await set_state(c.from_user.id, "ppct", {"code": code})
+    await c.answer()
+    await show(
+        c,
+        f"✏️ <b>{html.escape(code)}</b> uchun yangi chegirma foizini yozing (1 dan 99 gacha).",
+        kb([("🚫 Bekor", f"a:prv:{code}")]),
+    )
+
+
+@r.callback_query(F.data.regexp(r"^a:prd:[A-Z0-9_-]+$"), F.from_user.id.in_(ADMIN_IDS))
+async def a_prd(c: CallbackQuery):
+    await run("DELETE FROM promos WHERE code=?", c.data.split(":")[2])
+    await a_promos(c)
+
+
 # --- xabar yuborish ---
 @r.callback_query(F.data == "a:bc", F.from_user.id.in_(ADMIN_IDS))
 async def a_bc(c: CallbackQuery):
@@ -1206,6 +1398,35 @@ async def admin_input(m: Message):
         )
         return await _finish(uid, f"✅ Kanal qo'shildi: <b>{html.escape(ch.title or '')}</b>")
 
+    if action == "pcode":
+        code = (m.text or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_-]{3,20}", code):
+            return await m.answer("❗️ Promokod 3-20 belgi bo'lsin: faqat harf, raqam, - yoki _. Qayta yozing.")
+        await set_state(uid, "ppct", {"code": code})
+        ex = await one("SELECT percent FROM promos WHERE code=?", code)
+        note = f"\n(Bu promokod bor edi — {ex['percent']}%, yangisi bilan almashadi.)" if ex else ""
+        return await m.answer(
+            f"2/2 — <b>{html.escape(code)}</b> necha foiz chegirma bersin? (1 dan 99 gacha, masalan: <code>20</code>){note}"
+        )
+
+    if action == "ppct":
+        digits = re.sub(r"\D", "", m.text or "")
+        if not digits or not (1 <= int(digits) <= 99):
+            return await m.answer("❗️ 1 dan 99 gacha raqam yozing, masalan: <code>20</code>")
+        code = data["code"]
+        await run(
+            "INSERT INTO promos(code,percent,active,used,created_at) VALUES(?,?,1,0,?) "
+            "ON CONFLICT(code) DO UPDATE SET percent=excluded.percent",
+            code,
+            int(digits),
+            int(time.time()),
+        )
+        await clear_state(uid)
+        await m.answer(f"✅ Promokod saqlandi: <b>{html.escape(code)}</b> — <b>{int(digits)}%</b> chegirma")
+        return await bot.send_message(
+            uid, "🎟 Promokodlar:", reply_markup=kb([("🎟 Promokodlarga o'tish", "a:promos")], BACK)
+        )
+
     if action == "bc":
         await set_state(uid, "bc2", {"chat": m.chat.id, "msg": m.message_id})
         n = (await one("SELECT COUNT(*) FROM users WHERE active=1"))[0]
@@ -1248,6 +1469,10 @@ async def admin_input(m: Message):
 @r.message(F.chat.type == "private")
 async def fallback(m: Message):
     o = await draft(m.from_user.id)
+    if o and o["status"] == "promo_in" and m.text:
+        return await apply_promo(m, o)
+    if o and o["status"] == "promo":
+        return await m.answer("🎟 Quyidagilardan birini tanlang:", reply_markup=promo_kb())
     if o and o["status"] == "receipt":
         return await m.answer("🧾 To'lov <b>chekini</b> rasm qilib yuboring. Bekor qilish: /cancel")
     if o and o["status"] == "videos":
@@ -1275,6 +1500,12 @@ async def main():
     DB.row_factory = aiosqlite.Row
     await DB.execute("PRAGMA journal_mode=WAL")
     await DB.executescript(SCHEMA)
+    # eski bazaga yangi ustunlar (promokod)
+    for col, typ in (("promo_code", "TEXT"), ("promo_percent", "INTEGER")):
+        try:
+            await DB.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
+        except Exception:
+            pass
     await DB.commit()
 
     me = await bot.get_me()
