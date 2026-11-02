@@ -24,7 +24,7 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
-from aiogram.filters import BaseFilter, Command
+from aiogram.filters import BaseFilter, Command, invert_f
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -634,8 +634,20 @@ async def _upd_prompt(oid):
         await run("UPDATE orders SET prompt_msg_id=? WHERE id=?", msg.message_id, oid)
 
 
+class HasState(BaseFilter):
+    """Admin biror amal (video yuborish, rasm yuklash va h.k.) holatida ekanini tekshiradi."""
+
+    async def __call__(self, message: Message) -> bool:
+        return (
+            bool(message.from_user)
+            and message.from_user.id in ADMIN_IDS
+            and await get_state(message.from_user.id) is not None
+        )
+
+
 @r.message(
     F.chat.type == "private",
+    invert_f(HasState()),
     F.photo | F.video | F.video_note | F.document | F.animation,
 )
 async def on_media(m: Message):
@@ -1103,15 +1115,6 @@ async def broadcast(admin_id, chat, msg):
 
 
 # --- admin matn/rasm/video kiritishi (holat bo'yicha) ---
-class HasState(BaseFilter):
-    async def __call__(self, message: Message) -> bool:
-        return (
-            bool(message.from_user)
-            and message.from_user.id in ADMIN_IDS
-            and await get_state(message.from_user.id) is not None
-        )
-
-
 async def _finish(uid, text):
     await clear_state(uid)
     await bot.send_message(uid, text)
